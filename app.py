@@ -618,7 +618,7 @@ def make_trajectory_plot(
     fig = go.Figure()
 
     fig.add_trace(
-        go.Scattermapbox(
+        go.Scattermap(
             lat=month_df["lat"],
             lon=month_df["lon"],
             mode="lines+markers",
@@ -630,7 +630,7 @@ def make_trajectory_plot(
     )
 
     fig.add_trace(
-        go.Scattermapbox(
+        go.Scattermap(
             lat=initial_window[:, 0],
             lon=initial_window[:, 1],
             mode="lines+markers",
@@ -641,7 +641,7 @@ def make_trajectory_plot(
     )
 
     fig.add_trace(
-        go.Scattermapbox(
+        go.Scattermap(
             lat=predicted_future[:, 0],
             lon=predicted_future[:, 1],
             mode="lines+markers",
@@ -653,7 +653,7 @@ def make_trajectory_plot(
 
     if actual_future is not None and len(actual_future) > 0:
         fig.add_trace(
-            go.Scattermapbox(
+            go.Scattermap(
                 lat=actual_future[:, 0],
                 lon=actual_future[:, 1],
                 mode="lines+markers",
@@ -664,7 +664,7 @@ def make_trajectory_plot(
         )
 
     fig.add_trace(
-        go.Scattermapbox(
+        go.Scattermap(
             lat=[start_point[0]],
             lon=[start_point[1]],
             mode="markers",
@@ -677,7 +677,7 @@ def make_trajectory_plot(
     center_lon = month_df["lon"].mean()
 
     fig.update_layout(
-        mapbox=dict(
+        map=dict(
             style="open-street-map",
             center=dict(lat=center_lat, lon=center_lon),
             zoom=7
