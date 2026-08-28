@@ -9,6 +9,9 @@ import plotly.graph_objects as go
 import torch
 import torch.nn as nn
 
+import joblib
+from sklearn.preprocessing import StandardScaler
+
 
 warnings.filterwarnings("ignore")
 
@@ -17,7 +20,13 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ============================================================
 
-TEST_FILE = "Clean_IRO_GPS_2010-13.csv" 
+# For local testing, you can use:
+TEST_FILE = "Clean_IRO_GPS_2010-13.csv"
+
+# For public deployment, use an anonymized sample file:
+# TEST_FILE = "sample_Clean_IRO_GPS_2024-25.csv"
+
+SCALER_FILE = "scaler_window_10.pkl"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -25,54 +34,95 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ============================================================
 # AVAILABLE MODELS
 # ============================================================
-# Add more models here later.
-# Example:
-# "LSTM": {"path": "simple_lstm_digital_twin_model.pt", "type": "LSTM"}
 
 AVAILABLE_MODELS = {
-    "Univariate RNN": {
-        "path": "./simple_rnn_digital_twin_outputs/simple_rnn_digital_twin_model.pt",
-        "type": "RNN"
-    }
+    "RNN window 10": {
+        "path": "RNN_window_10.pt",
+        "type": "RNN",
+        "seq_length": 10
+    },
+    "LSTM window 10": {
+        "path": "LSTM_window_10.pt",
+        "type": "LSTM",
+        "seq_length": 10
+    },
+    "Transformer window 10": {
+        "path": "Transformer_window_10.pt",
+        "type": "Transformer",
+        "seq_length": 10
+    },
 }
 
 
 # ============================================================
 # MODEL DEFINITIONS
+# These match your original training file.
 # ============================================================
 
-class UnivariateRNN(nn.Module):
-    def __init__(
-        self,
-        input_size=2,
-        hidden_size=64,
-        num_layers=1,
-        output_size=2,
-        dropout=0.0
-    ):
-        super(UnivariateRNN, self).__init__()
-
+class RNNModel(nn.Module):
+    def __init__(self, input_dim=2, hidden_dim=64, num_layers=1, output_dim=2):
+        super().__init__()
         self.rnn = nn.RNN(
-            input_size=input_size,
-            hidden_size=hidden_size,
+            input_dim,
+            hidden_dim,
             num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-            nonlinearity="tanh"
+            batch_first=True
         )
-
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        out, hidden = self.rnn(x)
-        last_hidden = out[:, -1, :]
-        pred = self.fc(last_hidden)
-        return pred
+        out, _ = self.rnn(x)
+        return self.fc(out[:, -1, :])
 
 
-# Placeholder for later model extension.
-# class UnivariateLSTM(nn.Module):
-#     ...
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim=2, hidden_dim=64, num_layers=1, output_dim=2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_dim,
+            hidden_dim,
+            num_layers=num_layers,
+            batch_first=True
+        )
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+
+class TransformerModel(nn.Module):
+    def __init__(
+        self,
+        input_dim=2,
+        d_model=64,
+        nhead=4,
+        num_layers=2,
+        output_dim=2,
+        dim_feedforward=2048
+    ):
+        super().__init__()
+
+        self.input_projection = nn.Linear(input_dim, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            batch_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.fc = nn.Linear(d_model, output_dim)
+
+    def forward(self, x):
+        x = self.input_projection(x)
+        out = self.transformer(x)
+        return self.fc(out[:, -1, :])
 
 
 # ============================================================
@@ -80,10 +130,6 @@ class UnivariateRNN(nn.Module):
 # ============================================================
 
 def haversine_distance_km(lat1, lon1, lat2, lon2):
-    """
-    Vectorized haversine distance in kilometres.
-    """
-
     R = 6371.0
 
     lat1 = np.radians(lat1)
@@ -99,17 +145,11 @@ def haversine_distance_km(lat1, lon1, lat2, lon2):
         + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
     )
 
-    c = 2 * np.arcsin(np.sqrt(a))
+    c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
     return R * c
 
 
 def compute_rollout_metrics(actual, predicted):
-    """
-    Computes trajectory metrics using haversine distance.
-    actual and predicted must have shape [N, 2],
-    where columns are latitude and longitude.
-    """
-
     errors = haversine_distance_km(
         actual[:, 0],
         actual[:, 1],
@@ -138,18 +178,22 @@ def compute_rollout_metrics(actual, predicted):
 def load_data(path):
     df = pd.read_csv(path)
 
+    df["d_date"] = pd.to_datetime(df["d_date"], errors="coerce")
+
+    if "v_mask" in df.columns:
+        df = df[df["v_mask"] == 0]
+
     required_cols = ["seal", "d_date", "lat", "lon"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in {path}: {missing}")
 
     df = df[required_cols].copy()
 
-    df["d_date"] = pd.to_datetime(df["d_date"], errors="coerce")
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
 
-    df = df.dropna(subset=["seal", "d_date", "lat", "lon"])
+    df = df.dropna(subset=required_cols)
     df = df.sort_values(["seal", "d_date"]).reset_index(drop=True)
 
     df["year"] = df["d_date"].dt.year
@@ -160,36 +204,224 @@ def load_data(path):
     return df
 
 
+def build_fallback_scaler(df, features):
+    scaler = StandardScaler()
+    scaler.fit(df[features].values.astype(np.float32))
+    return scaler
+
+
 # ============================================================
-# MODEL LOADING
+# CHECKPOINT HELPERS
 # ============================================================
 
-@st.cache_resource
-def load_selected_model(model_name, model_path, model_type):
+def clean_state_dict_keys(state_dict):
+    cleaned = {}
+
+    for key, value in state_dict.items():
+        new_key = key
+
+        if new_key.startswith("module."):
+            new_key = new_key[len("module."):]
+
+        if new_key.startswith("model."):
+            new_key = new_key[len("model."):]
+
+        cleaned[new_key] = value
+
+    return cleaned
+
+
+def load_raw_state_dict(model_path):
     checkpoint = torch.load(
         model_path,
         map_location=DEVICE,
         weights_only=False
     )
 
-    features = checkpoint["features"]
-    seq_length = checkpoint["seq_length"]
-    hidden_size = checkpoint["hidden_size"]
-    num_layers = checkpoint["num_layers"]
-    scaler = checkpoint["scaler"]
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict):
+        state_dict = checkpoint
+    else:
+        raise ValueError(
+            "Unsupported checkpoint format. Expected a raw state_dict or checkpoint dictionary."
+        )
+
+    return clean_state_dict_keys(state_dict)
+
+
+def infer_rnn_hidden_layers(state_dict, model_type):
+    if model_type == "RNN":
+        base_key = "rnn.weight_ih_l0"
+        prefix = "rnn.weight_ih_l"
+        gate_multiplier = 1
+    elif model_type == "LSTM":
+        base_key = "lstm.weight_ih_l0"
+        prefix = "lstm.weight_ih_l"
+        gate_multiplier = 4
+    else:
+        return 64, 1
+
+    if base_key not in state_dict:
+        return 64, 1
+
+    weight = state_dict[base_key]
+    hidden_dim = int(weight.shape[0] // gate_multiplier)
+
+    layer_indices = []
+    for key in state_dict.keys():
+        if key.startswith(prefix) and "_reverse" not in key:
+            suffix = key.replace(prefix, "")
+            try:
+                layer_indices.append(int(suffix))
+            except ValueError:
+                pass
+
+    num_layers = max(layer_indices) + 1 if layer_indices else 1
+    return hidden_dim, num_layers
+
+
+def infer_transformer_params(state_dict):
+    d_model = 64
+    nhead = 4
+    num_layers = 2
+    dim_feedforward = 2048
+
+    if "input_projection.weight" in state_dict:
+        d_model = int(state_dict["input_projection.weight"].shape[0])
+
+    layer_indices = []
+    for key in state_dict.keys():
+        if key.startswith("transformer.layers."):
+            parts = key.split(".")
+            if len(parts) > 2:
+                try:
+                    layer_indices.append(int(parts[2]))
+                except ValueError:
+                    pass
+
+    if layer_indices:
+        num_layers = max(layer_indices) + 1
+
+    ff_keys = [
+        key for key in state_dict.keys()
+        if key.endswith("linear1.weight")
+    ]
+
+    if ff_keys:
+        dim_feedforward = int(state_dict[ff_keys[0]].shape[0])
+
+    for candidate in [8, 4, 2, 1]:
+        if d_model % candidate == 0:
+            nhead = candidate
+            break
+
+    return d_model, nhead, num_layers, dim_feedforward
+
+
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
+@st.cache_resource
+def load_selected_model(
+    model_name,
+    model_path,
+    model_type,
+    seq_length,
+    data_for_fallback_scaler
+):
+    state_dict = load_raw_state_dict(model_path)
+
+    features = ["lat", "lon"]
+
+    if os.path.exists(SCALER_FILE):
+        scaler = joblib.load(SCALER_FILE)
+        scaler_source = f"Loaded from {SCALER_FILE}"
+    else:
+        scaler = build_fallback_scaler(data_for_fallback_scaler, features)
+        scaler_source = "Fallback StandardScaler fitted on loaded CSV"
 
     if model_type == "RNN":
-        model = UnivariateRNN(
-            input_size=len(features),
-            hidden_size=hidden_size,
+        hidden_dim, num_layers = infer_rnn_hidden_layers(
+            state_dict,
+            model_type="RNN"
+        )
+
+        model = RNNModel(
+            input_dim=2,
+            hidden_dim=hidden_dim,
             num_layers=num_layers,
-            output_size=len(features)
+            output_dim=2
         ).to(DEVICE)
+
+        model_params = {
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "d_model": None,
+            "nhead": None,
+            "dim_feedforward": None,
+        }
+
+    elif model_type == "LSTM":
+        hidden_dim, num_layers = infer_rnn_hidden_layers(
+            state_dict,
+            model_type="LSTM"
+        )
+
+        model = LSTMModel(
+            input_dim=2,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            output_dim=2
+        ).to(DEVICE)
+
+        model_params = {
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "d_model": None,
+            "nhead": None,
+            "dim_feedforward": None,
+        }
+
+    elif model_type == "Transformer":
+        d_model, nhead, num_layers, dim_feedforward = infer_transformer_params(
+            state_dict
+        )
+
+        model = TransformerModel(
+            input_dim=2,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            output_dim=2,
+            dim_feedforward=dim_feedforward
+        ).to(DEVICE)
+
+        model_params = {
+            "hidden_dim": None,
+            "num_layers": num_layers,
+            "d_model": d_model,
+            "nhead": nhead,
+            "dim_feedforward": dim_feedforward,
+        }
 
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as error:
+        st.error(
+            f"Could not load checkpoint for {model_name}.\n\n"
+            f"Checkpoint path: {model_path}\n\n"
+            f"First checkpoint keys:\n{list(state_dict.keys())[:25]}\n\n"
+            f"Original PyTorch error:\n{error}"
+        )
+        st.stop()
+
     model.eval()
 
     model_info = {
@@ -197,9 +429,9 @@ def load_selected_model(model_name, model_path, model_type):
         "model_type": model_type,
         "features": features,
         "seq_length": seq_length,
-        "hidden_size": hidden_size,
-        "num_layers": num_layers,
         "model_path": model_path,
+        "scaler_source": scaler_source,
+        **model_params,
     }
 
     return model, scaler, model_info
@@ -210,15 +442,11 @@ def load_selected_model(model_name, model_path, model_type):
 # ============================================================
 
 def predict_one_step(model, scaler, month_df, features, seq_length, start_index):
-    """
-    Predicts only one next point using the true observed window.
-    """
-
     window_start = start_index - seq_length
     window_end = start_index
 
     initial_window_original = month_df[features].values[window_start:window_end]
-    initial_window_scaled = scaler.transform(initial_window_original)
+    initial_window_scaled = scaler.transform(initial_window_original).astype(np.float32)
 
     with torch.no_grad():
         x = torch.tensor(
@@ -245,13 +473,6 @@ def predict_sliding_window(
     start_index,
     prediction_horizon
 ):
-    """
-    Repeated next-step prediction using the real observed previous window.
-
-    This mode avoids accumulated drift because every prediction uses real
-    trajectory history rather than the model's own previous predictions.
-    """
-
     predictions_scaled = []
 
     for step in range(prediction_horizon):
@@ -261,7 +482,7 @@ def predict_sliding_window(
         window_end = current_index
 
         current_window_original = month_df[features].values[window_start:window_end]
-        current_window_scaled = scaler.transform(current_window_original)
+        current_window_scaled = scaler.transform(current_window_original).astype(np.float32)
 
         with torch.no_grad():
             x = torch.tensor(
@@ -299,18 +520,11 @@ def predict_autoregressive_rollout(
     start_index,
     prediction_horizon
 ):
-    """
-    Digital twin simulation mode.
-
-    The model predicts t+1, inserts its own prediction into the input window,
-    and then predicts the next point recursively.
-    """
-
     window_start = start_index - seq_length
     window_end = start_index
 
     initial_window_original = month_df[features].values[window_start:window_end]
-    current_window_scaled = scaler.transform(initial_window_original)
+    current_window_scaled = scaler.transform(initial_window_original).astype(np.float32)
 
     predictions_scaled = []
 
@@ -327,7 +541,7 @@ def predict_autoregressive_rollout(
             current_window_scaled = np.vstack([
                 current_window_scaled[1:],
                 pred_scaled.reshape(1, -1)
-            ])
+            ]).astype(np.float32)
 
     predictions_scaled = np.array(predictions_scaled)
     predicted_future = scaler.inverse_transform(predictions_scaled)
@@ -363,7 +577,7 @@ def run_prediction_mode(
             start_index=start_index
         )
 
-    elif prediction_mode == "Sliding-window prediction":
+    if prediction_mode == "Sliding-window prediction":
         return predict_sliding_window(
             model=model,
             scaler=scaler,
@@ -374,7 +588,7 @@ def run_prediction_mode(
             prediction_horizon=prediction_horizon
         )
 
-    elif prediction_mode == "Autoregressive rollout":
+    if prediction_mode == "Autoregressive rollout":
         return predict_autoregressive_rollout(
             model=model,
             scaler=scaler,
@@ -385,8 +599,7 @@ def run_prediction_mode(
             prediction_horizon=prediction_horizon
         )
 
-    else:
-        raise ValueError(f"Unknown prediction mode: {prediction_mode}")
+    raise ValueError(f"Unknown prediction mode: {prediction_mode}")
 
 
 # ============================================================
@@ -399,7 +612,8 @@ def make_trajectory_plot(
     predicted_future,
     actual_future,
     start_point,
-    prediction_mode
+    prediction_mode,
+    selected_model_name
 ):
     fig = go.Figure()
 
@@ -431,7 +645,7 @@ def make_trajectory_plot(
             lat=predicted_future[:, 0],
             lon=predicted_future[:, 1],
             mode="lines+markers",
-            name=f"Predicted trajectory: {prediction_mode}",
+            name=f"Prediction: {selected_model_name}",
             marker=dict(size=8),
             line=dict(width=4)
         )
@@ -477,13 +691,13 @@ def make_trajectory_plot(
             xanchor="left",
             x=0.01
         ),
-        title=f"Seal Trajectory Prediction Mode: {prediction_mode}"
+        title=f"{selected_model_name} | {prediction_mode}"
     )
 
     return fig
 
 
-def make_error_plot(result_df, prediction_mode):
+def make_error_plot(result_df, prediction_mode, selected_model_name):
     fig = go.Figure()
 
     fig.add_trace(
@@ -496,7 +710,7 @@ def make_error_plot(result_df, prediction_mode):
     )
 
     fig.update_layout(
-        title=f"Pointwise Error Over Horizon: {prediction_mode}",
+        title=f"Pointwise Error Over Horizon: {selected_model_name} | {prediction_mode}",
         xaxis_title="Prediction step",
         yaxis_title="Error distance (km)",
         height=420,
@@ -506,7 +720,7 @@ def make_error_plot(result_df, prediction_mode):
     return fig
 
 
-def make_metric_bar_plot(metrics, prediction_mode):
+def make_metric_bar_plot(metrics, prediction_mode, selected_model_name):
     metrics_plot_df = pd.DataFrame({
         "Metric": list(metrics.keys()),
         "Value": list(metrics.values())
@@ -523,7 +737,7 @@ def make_metric_bar_plot(metrics, prediction_mode):
     )
 
     fig.update_layout(
-        title=f"Aggregate Error Metrics: {prediction_mode}",
+        title=f"Aggregate Error Metrics: {selected_model_name} | {prediction_mode}",
         xaxis_title="Metric",
         yaxis_title="Value",
         height=450,
@@ -608,6 +822,17 @@ def get_prediction_mode_description_table():
     })
 
 
+def safe_filename(text):
+    return (
+        str(text)
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace("|", "_")
+        .replace(":", "_")
+    )
+
+
 # ============================================================
 # STREAMLIT APP
 # ============================================================
@@ -622,8 +847,8 @@ st.title("Interactive Seal Movement Digital Twin")
 
 st.markdown(
     """
-This interface supports multiple prediction modes for seal trajectory modelling.
-The current deployed model uses only latitude and longitude as input features.
+This interface supports multiple prediction modes and multiple trained univariate trajectory models.
+The current models use latitude and longitude as input features.
 """
 )
 
@@ -658,6 +883,7 @@ selected_model_name = st.sidebar.selectbox(
 selected_model_config = AVAILABLE_MODELS[selected_model_name]
 selected_model_path = selected_model_config["path"]
 selected_model_type = selected_model_config["type"]
+selected_model_seq_length = selected_model_config["seq_length"]
 
 if not os.path.exists(selected_model_path):
     st.sidebar.error(f"Model file not found: {selected_model_path}")
@@ -666,13 +892,13 @@ if not os.path.exists(selected_model_path):
 model, scaler, model_info = load_selected_model(
     model_name=selected_model_name,
     model_path=selected_model_path,
-    model_type=selected_model_type
+    model_type=selected_model_type,
+    seq_length=selected_model_seq_length,
+    data_for_fallback_scaler=df
 )
 
 features = model_info["features"]
 seq_length = model_info["seq_length"]
-hidden_size = model_info["hidden_size"]
-num_layers = model_info["num_layers"]
 
 st.sidebar.header("Prediction Mode")
 
@@ -726,6 +952,10 @@ start_index = st.sidebar.slider(
 )
 
 max_possible_horizon = len(month_df) - start_index
+
+if max_possible_horizon <= 0:
+    st.warning("No future points are available after this start index.")
+    st.stop()
 
 if prediction_mode == "One-step prediction":
     prediction_horizon = 1
@@ -794,7 +1024,8 @@ with left_col:
         predicted_future=predicted_future,
         actual_future=actual_future,
         start_point=start_point,
-        prediction_mode=prediction_mode
+        prediction_mode=prediction_mode,
+        selected_model_name=selected_model_name
     )
 
     st.plotly_chart(trajectory_fig, use_container_width=True)
@@ -802,38 +1033,68 @@ with left_col:
 with right_col:
     st.subheader("Selected configuration")
 
+    config_fields = [
+        "Selected model",
+        "Model type",
+        "Prediction mode",
+        "Seal",
+        "Month",
+        "Start index",
+        "Prediction horizon",
+        "Input sequence length",
+        "Input features",
+        "Scaler source",
+        "Device"
+    ]
+
+    config_values = [
+        selected_model_name,
+        selected_model_type,
+        prediction_mode,
+        selected_seal,
+        selected_month,
+        start_index,
+        prediction_horizon,
+        seq_length,
+        ", ".join(features),
+        model_info["scaler_source"],
+        str(DEVICE)
+    ]
+
+    if selected_model_type in ["RNN", "LSTM"]:
+        config_fields.extend(["Hidden dimension", "Number of layers"])
+        config_values.extend([
+            model_info["hidden_dim"],
+            model_info["num_layers"]
+        ])
+
+    if selected_model_type == "Transformer":
+        config_fields.extend([
+            "d_model",
+            "nhead",
+            "Number of transformer layers",
+            "Feedforward dimension"
+        ])
+        config_values.extend([
+            model_info["d_model"],
+            model_info["nhead"],
+            model_info["num_layers"],
+            model_info["dim_feedforward"]
+        ])
+
     config_df = pd.DataFrame({
-        "Field": [
-            "Selected model",
-            "Model type",
-            "Prediction mode",
-            "Seal",
-            "Month",
-            "Start index",
-            "Prediction horizon",
-            "Input sequence length",
-            "Input features",
-            "Hidden size",
-            "Number of layers",
-            "Device"
-        ],
-        "Value": [
-            selected_model_name,
-            selected_model_type,
-            prediction_mode,
-            selected_seal,
-            selected_month,
-            start_index,
-            prediction_horizon,
-            seq_length,
-            ", ".join(features),
-            hidden_size,
-            num_layers,
-            str(DEVICE)
-        ]
+        "Field": config_fields,
+        "Value": config_values
     })
 
     st.dataframe(config_df, use_container_width=True)
+
+    if model_info["scaler_source"].startswith("Fallback"):
+        st.warning(
+            "The original training scaler file was not found. "
+            "A fallback StandardScaler was fitted on the loaded CSV. "
+            "For final experiments and public deployment, keep scaler_window_10.pkl with the app."
+        )
 
     st.subheader("Prediction start point")
 
@@ -855,7 +1116,12 @@ with right_col:
     st.download_button(
         label="Download error metrics CSV",
         data=metrics_df.to_csv(index=False),
-        file_name=f"metrics_{selected_model_name}_{prediction_mode}_seal_{selected_seal}_{selected_month}.csv",
+        file_name=(
+            f"metrics_{safe_filename(selected_model_name)}_"
+            f"{safe_filename(prediction_mode)}_"
+            f"seal_{safe_filename(selected_seal)}_"
+            f"{selected_month}.csv"
+        ),
         mime="text/csv"
     )
 
@@ -866,7 +1132,11 @@ with right_col:
 
 st.subheader("Pointwise prediction error")
 
-error_fig = make_error_plot(result_df, prediction_mode)
+error_fig = make_error_plot(
+    result_df=result_df,
+    prediction_mode=prediction_mode,
+    selected_model_name=selected_model_name
+)
 st.plotly_chart(error_fig, use_container_width=True)
 
 
@@ -876,7 +1146,11 @@ st.plotly_chart(error_fig, use_container_width=True)
 
 st.subheader("Aggregate error metrics")
 
-metric_bar_fig = make_metric_bar_plot(metrics, prediction_mode)
+metric_bar_fig = make_metric_bar_plot(
+    metrics=metrics,
+    prediction_mode=prediction_mode,
+    selected_model_name=selected_model_name
+)
 st.plotly_chart(metric_bar_fig, use_container_width=True)
 
 
@@ -925,7 +1199,12 @@ st.dataframe(result_df, use_container_width=True)
 st.download_button(
     label="Download predicted trajectory CSV",
     data=result_df.to_csv(index=False),
-    file_name=f"prediction_{selected_model_name}_{prediction_mode}_seal_{selected_seal}_{selected_month}.csv",
+    file_name=(
+        f"prediction_{safe_filename(selected_model_name)}_"
+        f"{safe_filename(prediction_mode)}_"
+        f"seal_{safe_filename(selected_seal)}_"
+        f"{selected_month}.csv"
+    ),
     mime="text/csv"
 )
 
@@ -946,9 +1225,16 @@ Start index: {start_index}
 Prediction horizon: {prediction_horizon}
 Input sequence length: {seq_length}
 Input features: {features}
-Hidden size: {hidden_size}
-Number of layers: {num_layers}
+Scaler source: {model_info["scaler_source"]}
+Model path: {selected_model_path}
 Device: {DEVICE}
+
+Model parameters:
+Hidden dimension: {model_info["hidden_dim"]}
+Number of layers: {model_info["num_layers"]}
+d_model: {model_info["d_model"]}
+nhead: {model_info["nhead"]}
+Feedforward dimension: {model_info["dim_feedforward"]}
 
 Error metrics:
 {metrics_df.to_string(index=False)}
@@ -957,7 +1243,12 @@ Error metrics:
 st.download_button(
     label="Download simulation summary TXT",
     data=summary_text,
-    file_name=f"summary_{selected_model_name}_{prediction_mode}_seal_{selected_seal}_{selected_month}.txt",
+    file_name=(
+        f"summary_{safe_filename(selected_model_name)}_"
+        f"{safe_filename(prediction_mode)}_"
+        f"seal_{safe_filename(selected_seal)}_"
+        f"{selected_month}.txt"
+    ),
     mime="text/plain"
 )
 
@@ -970,7 +1261,7 @@ st.markdown(
     """
 ### Interpretation
 
-The interface now separates the selected model from the selected prediction mode.
+The interface separates the selected model from the selected prediction mode.
 
 In **one-step prediction**, the model predicts only the next GPS point from the observed input sequence.
 
